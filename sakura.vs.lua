@@ -2846,17 +2846,23 @@ end
 
 function setSpinEnabled(on)
     if on then
-        startSpin()
-        -- Compulsory: spin açılınca Anti Die de açılır
+        -- Önce Anti Die aç (1 sn önce), sonra Spin başlasın
         if not antiDieEnabled then
             antiDieEnabled = true
             pcall(function() AntiDieModule.start() end)
             if setAntiDieVisual then pcall(setAntiDieVisual, true) end
         end
+        spinEnabled = true -- toggle state immediate
+        if setSpinVisual then pcall(setSpinVisual, true) end
+        task.spawn(function()
+            task.wait(1)
+            if not spinEnabled then return end -- kapatıldıysa başlatma
+            startSpin()
+        end)
     else
         stopSpin()
+        if setSpinVisual then pcall(setSpinVisual, false) end
     end
-    if setSpinVisual then pcall(setSpinVisual, on == true) end
     pcall(saveAllSettings)
 end
 
