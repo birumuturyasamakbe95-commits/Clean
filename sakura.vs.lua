@@ -576,6 +576,15 @@ function CarrySystem:updateMovement(dt)
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then return end
 
+    -- Clean Hub Bat Bypass owns velocity while active — don't fight it
+    if BatBypassV2 and BatBypassV2.Enabled then
+        local lv = self._lvBoost
+        if lv and lv.Parent then
+            lv.PlaneVelocity = Vector2.zero
+        end
+        return
+    end
+
     local speed = self:getActiveSpeed()
     local moveDir = hum.MoveDirection
     local moving = moveDir.Magnitude > 0.1
@@ -4626,12 +4635,15 @@ function stopSpectrumBypassAimbot()
 end
 
 
+
 -- ============================================================
--- BAT BYPASS V2 (from Clean Hub) — Anti Aimbot V2 + Bat Aimbot Mode V2
+-- BAT BYPASS V2 — full port from Clean Hub (SnowVS.BatBypass)
+-- Used by: Anti Aimbot Mode V2 + Bat Aimbot Mode V2
 -- ============================================================
 BAT_V2_SPEED = BAT_V2_SPEED or 55
 BAT_V2_HIT_DIST = BAT_V2_HIT_DIST or 13
 BAT_V2_LEAD_STUDS = BAT_V2_LEAD_STUDS or 3
+BAT_V2_BODY_LOCK_RANGE = BAT_V2_BODY_LOCK_RANGE or 60
 
 BatBypassV2 = {
     Enabled = false,
@@ -4653,15 +4665,15 @@ BatBypassV2 = {
         realPingMs = 0,
     },
     ZCFG = {
-        FOLLOW_SPEED = 55,
-        ACTIVATE_DISTANCE = 13,
+        FOLLOW_SPEED = BAT_V2_SPEED or 55,
+        ACTIVATE_DISTANCE = BAT_V2_HIT_DIST or 13,
         MIN_FOLLOW_DISTANCE = 1,
         PREDICTION_TIME = 0.22,
-        PREDICT_AHEAD = 3,
+        PREDICT_AHEAD = BAT_V2_LEAD_STUDS or 3,
         MAX_VELOCITY_CHANGE = 150,
         VELOCITY_SMOOTHING = 0.2,
         MAX_HORIZONTAL_VELOCITY = 80,
-        SERVER_TICKRATE = 1/60,
+        SERVER_TICKRATE = 1 / 60,
         MIN_PING_COMPENSATION = 0.03,
         MAX_PING_COMPENSATION = 0.25,
         ACCELERATION_PREDICTION_WEIGHT = 0.3,
@@ -4673,19 +4685,25 @@ BatBypassV2 = {
     },
 }
 
-local function bbAvgVectors(list)
-    if #list == 0 then return Vector3.zero end
+local function bbAverageVectors(vectors)
+    if #vectors == 0 then
+        return Vector3.zero
+    end
     local sum = Vector3.zero
-    for i = 1, #list do sum = sum + list[i] end
-    return sum / #list
+    for _, entry in ipairs(vectors) do
+        sum = sum + entry
+    end
+    return sum / #vectors
 end
 
-local function bbPush(list, entry, maxN)
-    table.insert(list, entry)
-    while #list > maxN do table.remove(list, 1) end
+local function bbPushBounded(history, entry, maxEntries)
+    table.insert(history, entry)
+    while #history > maxEntries do
+        table.remove(history, 1)
+    end
 end
 
-local function bbResetPred()
+local function bbResetPredictionState()
     local z = BatBypassV2.Z
     z.targetPlayer = nil
     z.lastTargetPos = nil
@@ -4695,212 +4713,319 @@ local function bbResetPred()
     z.accelerationHistory = {}
     z.aerialVelocityHistory = {}
     z.previousDirection = nil
-    z.lastDirectionChangeTime = 0
     z.airborneTime = 0
 end
 
-function BatBypassV2.FindBat()
-    local char = LP.Character
-    if char then
-        local t = char:FindFirstChildOfClass("Tool")
-        if t then return t end
-        local bat = char:FindFirstChild("Bat")
-        if bat and bat:IsA("Tool") then return bat end
+local function bbApplyAngularAim(rootPart, direction)
+    if direction.Magnitude < 0.01 then
+        return
     end
-    local bp = LP:FindFirstChildOfClass("Backpack")
-    if bp then
-        local bat = bp:FindFirstChild("Bat")
-        if bat and bat:IsA("Tool") then return bat end
-        for _, v in ipairs(bp:GetChildren()) do
-            if v:IsA("Tool") then return v end
+    local crossVector = rootPart.CFrame.LookVector:Cross(direction.Unit)
+    local angle = math.asin(math.clamp(crossVector.Magnitude, -1, 1))
+    if crossVector.Magnitude > 0.1 then
+        rootPart.AssemblyAngularVelocity = crossVector.Unit * angle * 80
+    else
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local function bbUpdatePing()
+    local ok, result = pcall(function()
+        return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and type(result) == "number" then
+        BatBypassV2.Z.realPingMs = result
+        local sec = result / 1000
+        local cfg = BatBypassV2.ZCFG
+        BatBypassV2.Z.currentPing = math.clamp(sec, cfg.MIN_PING_COMPENSATION, cfg.MAX_PING_COMPENSATION)
+    end
+end
+
+function BatBypassV2.FindBat()
+    local character = LP.Character
+    if not character then
+        return nil
+    end
+    local tool = character:FindFirstChildOfClass("Tool")
+    if tool then
+        local n = string.lower(tool.Name)
+        if string.find(n, "bat", 1, true) or string.find(n, "slap", 1, true) then
+            return tool
+        end
+    end
+    local backpack = LP:FindFirstChildOfClass("Backpack")
+    if backpack then
+        for _, child in ipairs(backpack:GetChildren()) do
+            if child:IsA("Tool") then
+                local n = string.lower(child.Name)
+                if string.find(n, "bat", 1, true) or string.find(n, "slap", 1, true) then
+                    return child
+                end
+            end
+        end
+    end
+    -- fallback: any tool in character/backpack
+    if tool then
+        return tool
+    end
+    if backpack then
+        for _, child in ipairs(backpack:GetChildren()) do
+            if child:IsA("Tool") then
+                return child
+            end
         end
     end
     return nil
 end
 
-local function bbFindClosest(root)
-    local best, bestDist = nil, 1e9
+local function bbFindClosestPlayer(rootPart)
+    local closestDistance = math.huge
+    local closestPlayer = nil
     local list = _GetPlayersCached()
     for i = 1, #list do
-        local p = list[i]
-        if p ~= LP then
-            local c = p.Character
-            local hrp = c and c:FindFirstChild("HumanoidRootPart")
-            local hum = c and c:FindFirstChildOfClass("Humanoid")
-            if hrp and hum and hum.Health > 0 then
-                local d = (hrp.Position - root.Position).Magnitude
-                if d < bestDist then
-                    bestDist = d
-                    best = p
+        local player = list[i]
+        if player ~= LP and player.Character then
+            local humanoidRootPart = player.Character:FindFirstChild("HumanoidRootPart")
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            if humanoidRootPart and humanoid and humanoid.Health > 0 then
+                local d = (humanoidRootPart.Position - rootPart.Position).Magnitude
+                if d < closestDistance then
+                    closestDistance = d
+                    closestPlayer = player
                 end
             end
         end
     end
-    return best
+    return closestPlayer
 end
 
 function BatBypassV2.Stop()
+    local z = BatBypassV2.Z
     BatBypassV2.Enabled = false
     if BatBypassV2.Connection then
-        pcall(function() BatBypassV2.Connection:Disconnect() end)
+        pcall(function()
+            BatBypassV2.Connection:Disconnect()
+        end)
         BatBypassV2.Connection = nil
     end
-    local char = LP.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hum then hum.AutoRotate = true end
-    if hrp then hrp.AssemblyAngularVelocity = Vector3.zero end
-    bbResetPred()
-    BatBypassV2.Z.lastActivationTime = 0
+    local character = LP.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if humanoid then
+        humanoid.AutoRotate = true
+    end
+    if root then
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+    bbResetPredictionState()
+    z.lastActivationTime = 0
 end
 
 function BatBypassV2.Start(speedOverride)
-    if BatBypassV2.Connection then return end
-    local char = LP.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hum or not hrp then return end
+    if BatBypassV2.Connection then
+        return
+    end
+    local character = LP.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not rootPart then
+        return
+    end
 
-    local cfg = BatBypassV2.ZCFG
-    cfg.FOLLOW_SPEED = tonumber(speedOverride) or tonumber(BYPASS_AIMBOT_SPEED) or tonumber(BAT_V2_SPEED) or 55
-    cfg.ACTIVATE_DISTANCE = tonumber(BAT_V2_HIT_DIST) or 13
-    cfg.PREDICT_AHEAD = tonumber(BAT_V2_LEAD_STUDS) or 3
+    local zcfg = BatBypassV2.ZCFG
+    zcfg.FOLLOW_SPEED = tonumber(speedOverride)
+        or tonumber(BYPASS_AIMBOT_SPEED)
+        or tonumber(BAT_AIMBOT_SPEED)
+        or tonumber(BAT_V2_SPEED)
+        or 55
+    zcfg.ACTIVATE_DISTANCE = tonumber(BAT_V2_HIT_DIST) or 13
+    zcfg.PREDICT_AHEAD = tonumber(BAT_V2_LEAD_STUDS) or 3
 
     BatBypassV2.Enabled = true
-    hum.AutoRotate = false
+    humanoid.AutoRotate = false
+
     local tool = BatBypassV2.FindBat()
-    if tool and tool.Parent ~= char then
-        pcall(function() hum:EquipTool(tool) end)
+    if tool and tool.Parent ~= character then
+        pcall(function()
+            humanoid:EquipTool(tool)
+        end)
     end
 
     if not BatBypassV2._pingStarted then
         BatBypassV2._pingStarted = true
         task.spawn(function()
             while _G.SakuraVsRunning do
-                local ok, ping = pcall(function()
-                    return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
-                end)
-                if ok and type(ping) == "number" then
-                    BatBypassV2.Z.realPingMs = ping
-                    BatBypassV2.Z.currentPing = math.clamp(ping / 1000, cfg.MIN_PING_COMPENSATION, cfg.MAX_PING_COMPENSATION)
-                end
+                bbUpdatePing()
                 task.wait(0.5)
             end
         end)
     end
+    bbUpdatePing()
 
-    BatBypassV2.Connection = RunService.RenderStepped:Connect(function(dt)
+    BatBypassV2.Connection = RunService.RenderStepped:Connect(function(deltaTime)
         if not BatBypassV2.Enabled then
             BatBypassV2.Stop()
             return
         end
+
         local z = BatBypassV2.Z
-        local zcfg = BatBypassV2.ZCFG
-        zcfg.FOLLOW_SPEED = tonumber(BYPASS_AIMBOT_SPEED) or zcfg.FOLLOW_SPEED
-
-        local char2 = LP.Character
-        local root = char2 and char2:FindFirstChild("HumanoidRootPart")
-        local humanoid = char2 and char2:FindFirstChildOfClass("Humanoid")
-        if not root or not humanoid or humanoid.Health <= 0 then return end
-        humanoid.AutoRotate = false
-
-        local tool2 = char2:FindFirstChildOfClass("Tool") or BatBypassV2.FindBat()
-        if tool2 and tool2.Parent ~= char2 then
-            pcall(function() humanoid:EquipTool(tool2) end)
+        zcfg = BatBypassV2.ZCFG
+        -- live speed from UI boxes
+        local liveSpd = tonumber(BYPASS_AIMBOT_SPEED) or tonumber(BAT_AIMBOT_SPEED)
+        if liveSpd and liveSpd > 0 then
+            zcfg.FOLLOW_SPEED = liveSpd
         end
 
-        z.targetPlayer = bbFindClosest(root)
-        local tChar = z.targetPlayer and z.targetPlayer.Character
-        local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
-        local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
-        if not tRoot or not tHum or tHum.Health <= 0 then
-            bbResetPred()
+        local character2 = LP.Character
+        local rootPart2 = character2 and character2:FindFirstChild("HumanoidRootPart")
+        local humanoid2 = character2 and character2:FindFirstChildOfClass("Humanoid")
+        if not rootPart2 or not humanoid2 or humanoid2.Health <= 0 then
+            return
+        end
+        humanoid2.AutoRotate = false
+        rootPart = rootPart2
+        humanoid = humanoid2
+
+        tool = character2:FindFirstChildOfClass("Tool") or BatBypassV2.FindBat()
+        if tool and tool.Parent ~= character2 then
+            pcall(function()
+                humanoid:EquipTool(tool)
+            end)
+        end
+
+        z.targetPlayer = bbFindClosestPlayer(rootPart)
+        local targetChar = z.targetPlayer and z.targetPlayer.Character
+        local targetRoot = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+        local targetHum = targetChar and targetChar:FindFirstChildOfClass("Humanoid")
+        if not targetRoot or not targetHum or targetHum.Health <= 0 then
+            bbResetPredictionState()
             return
         end
 
-        local position = tRoot.Position
-        local sampleDt = math.max(dt, 1/240)
+        local position = targetRoot.Position
+        local sampleDeltaTime = math.max(deltaTime, 1 / 240)
+
         if z.lastTargetPos then
-            local targetVel = (position - z.lastTargetPos) / sampleDt
-            local change = targetVel - z.targetVelocity
-            if change.Magnitude > zcfg.MAX_VELOCITY_CHANGE then
-                targetVel = z.targetVelocity + change.Unit * zcfg.MAX_VELOCITY_CHANGE
+            local targetVelocity = (position - z.lastTargetPos) / sampleDeltaTime
+            local vector = targetVelocity - z.targetVelocity
+            if vector.Magnitude > zcfg.MAX_VELOCITY_CHANGE then
+                targetVelocity = z.targetVelocity + vector.Unit * zcfg.MAX_VELOCITY_CHANGE
             end
-            local horiz = Vector3.new(targetVel.X, 0, targetVel.Z)
-            if horiz.Magnitude > zcfg.MAX_HORIZONTAL_VELOCITY then
-                local clamped = horiz.Unit * zcfg.MAX_HORIZONTAL_VELOCITY
-                targetVel = Vector3.new(clamped.X, targetVel.Y, clamped.Z)
+            local vector3 = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
+            if vector3.Magnitude > zcfg.MAX_HORIZONTAL_VELOCITY then
+                local clamped = vector3.Unit * zcfg.MAX_HORIZONTAL_VELOCITY
+                targetVelocity = Vector3.new(clamped.X, targetVelocity.Y, clamped.Z)
             end
-            bbPush(z.accelerationHistory, (targetVel - z.targetVelocity) / sampleDt, 4)
-            bbPush(z.velocityHistory, targetVel, 8)
-            z.targetVelocity = targetVel
-            z.smoothedVelocity = z.smoothedVelocity:Lerp(targetVel, zcfg.VELOCITY_SMOOTHING)
+            bbPushBounded(z.accelerationHistory, (targetVelocity - z.targetVelocity) / sampleDeltaTime, 4)
+            bbPushBounded(z.velocityHistory, targetVelocity, 8)
+            z.targetVelocity = targetVelocity
+            z.smoothedVelocity = z.smoothedVelocity:Lerp(targetVelocity, zcfg.VELOCITY_SMOOTHING)
         end
         z.lastTargetPos = position
 
-        local isAirborne = tHum.FloorMaterial == Enum.Material.Air
-        z.airborneTime = isAirborne and (z.airborneTime + sampleDt) or 0
+        local isAirborne = targetHum.FloorMaterial == Enum.Material.Air
+        if isAirborne then
+            z.airborneTime = z.airborneTime + sampleDeltaTime
+        else
+            z.airborneTime = 0
+        end
         if isAirborne and z.airborneTime >= zcfg.MIN_AIRBORNE_TIME then
-            bbPush(z.aerialVelocityHistory, z.smoothedVelocity, 6)
+            bbPushBounded(z.aerialVelocityHistory, z.targetVelocity, 6)
+        elseif not isAirborne then
+            z.aerialVelocityHistory = {}
         end
 
-        local avgVel = bbAvgVectors(z.velocityHistory)
-        if avgVel.Magnitude < 0.01 then avgVel = z.smoothedVelocity end
-        local avgAcc = bbAvgVectors(z.accelerationHistory)
+        local smoothedVelocity = z.smoothedVelocity
+        if isAirborne and #z.aerialVelocityHistory > 0 then
+            local vector = bbAverageVectors(z.aerialVelocityHistory)
+            smoothedVelocity = Vector3.new(vector.X, z.targetVelocity.Y, vector.Z) * zcfg.AIR_CONTROL_FACTOR
+        end
 
-        local dir = Vector3.new(avgVel.X, 0, avgVel.Z)
-        if dir.Magnitude > 0.5 then
-            local unit = dir.Unit
-            if z.previousDirection then
-                local dot = z.previousDirection:Dot(unit)
-                if dot < 0.5 then
-                    z.lastDirectionChangeTime = _tick()
-                end
+        local changedDirectionQuickly = false
+        local horizVel = Vector3.new(z.targetVelocity.X, 0, z.targetVelocity.Z)
+        if horizVel.Magnitude > 5 then
+            local unit = horizVel.Unit
+            if z.previousDirection and z.previousDirection:Dot(unit) < 0.5 then
+                changedDirectionQuickly = (tick() - (z.lastDirectionChangeTime or 0)) < zcfg.DIRECTION_CHANGE_DETECTION_TIME
+                z.lastDirectionChangeTime = tick()
             end
             z.previousDirection = unit
         end
 
-        local predictT = zcfg.PREDICTION_TIME + (z.currentPing or 0.1)
-        local quickMul = 1
-        if (_tick() - (z.lastDirectionChangeTime or 0)) < zcfg.DIRECTION_CHANGE_DETECTION_TIME then
-            quickMul = zcfg.QUICK_DIRECTION_CHANGE_MULTIPLIER
+        local predictionTime = (z.currentPing or 0.1) + zcfg.SERVER_TICKRATE
+        if changedDirectionQuickly then
+            predictionTime = predictionTime * zcfg.QUICK_DIRECTION_CHANGE_MULTIPLIER
         end
 
-        local predVel = avgVel + avgAcc * zcfg.ACCELERATION_PREDICTION_WEIGHT * predictT
+        local predictedPosition = position
+            + smoothedVelocity * predictionTime
+            + bbAverageVectors(z.accelerationHistory)
+                * zcfg.ACCELERATION_PREDICTION_WEIGHT
+                * predictionTime
+                * predictionTime
+                * 0.5
+
+        local leadTime = zcfg.PREDICTION_TIME * 1.1
+        local leadPosition
         if isAirborne then
-            predVel = predVel * zcfg.AIR_CONTROL_FACTOR
-            predVel = predVel - Vector3.new(0, zcfg.GRAVITY * 0.15 * predictT, 0)
+            leadPosition = predictedPosition
+                + smoothedVelocity * leadTime
+                + Vector3.new(0, -0.5 * zcfg.GRAVITY * leadTime * leadTime, 0)
+        else
+            leadPosition = predictedPosition + smoothedVelocity * leadTime
         end
 
-        local lead = zcfg.PREDICT_AHEAD * quickMul
-        local aimPos = position + predVel * predictT + (dir.Magnitude > 0.5 and dir.Unit * lead or Vector3.zero)
-        aimPos = aimPos + Vector3.new(0, 1.2, 0)
-
-        local delta = aimPos - root.Position
-        local dist = delta.Magnitude
-        local flat = Vector3.new(delta.X, 0, delta.Z)
-
-        if dist > 0.05 and flat.Magnitude > 0.05 then
-            local look = CFrame.lookAt(root.Position, Vector3.new(aimPos.X, root.Position.Y, aimPos.Z))
-            root.CFrame = CFrame.new(root.Position) * (look - look.Position)
+        local flatSmoothed = Vector3.new(smoothedVelocity.X, 0, smoothedVelocity.Z)
+        if flatSmoothed.Magnitude > 1 then
+            leadPosition = leadPosition + flatSmoothed.Unit * zcfg.PREDICT_AHEAD
         end
 
-        local activate = zcfg.ACTIVATE_DISTANCE
-        local followSpd = zcfg.FOLLOW_SPEED
-        if dist <= activate * 3 then
-            local moveDir = flat.Magnitude > 0.05 and flat.Unit or Vector3.zero
-            if dist > zcfg.MIN_FOLLOW_DISTANCE and moveDir.Magnitude > 0 then
-                local spd = followSpd
-                if dist < activate then spd = followSpd * 1.15 end
-                local curY = root.AssemblyLinearVelocity.Y
-                root.AssemblyLinearVelocity = Vector3.new(moveDir.X * spd, curY, moveDir.Z * spd)
-                pcall(function() humanoid:Move(moveDir, false) end)
+        local targetDirection = leadPosition - rootPart.Position
+        bbApplyAngularAim(rootPart, targetDirection)
+
+        -- swing / activate when in range (0.3s cooldown) — exact Clean Hub behavior
+        local bodyDist = (position - rootPart.Position).Magnitude
+        local withinActivationRange = bodyDist <= zcfg.ACTIVATE_DISTANCE
+        if withinActivationRange then
+            if (tick() - (z.lastActivationTime or 0)) >= 0.3 then
+                if tool then
+                    pcall(function()
+                        tool:Activate()
+                    end)
+                end
+                z.lastActivationTime = tick()
             end
+        end
+
+        -- follow velocity — exact Clean Hub: full 3D unit * FOLLOW_SPEED
+        if targetDirection.Magnitude > zcfg.MIN_FOLLOW_DISTANCE then
+            rootPart.AssemblyLinearVelocity = targetDirection.Unit * zcfg.FOLLOW_SPEED
+        else
+            rootPart.AssemblyLinearVelocity = Vector3.new(0, rootPart.AssemblyLinearVelocity.Y * 0.5, 0)
         end
     end)
 end
 
+function BatBypassV2.Toggle()
+    if BatBypassV2.Enabled then
+        BatBypassV2.Stop()
+    else
+        BatBypassV2.Start()
+    end
+end
+
 _G.SakuraBatBypassV2 = BatBypassV2
+_G.AceStartAntiBypassAimbot = function()
+    local spd = tonumber(BYPASS_AIMBOT_SPEED) or tonumber(BAT_V2_SPEED) or 55
+    BatBypassV2.Start(spd)
+    _G.AceAntiBypassAimbotOn = true
+    return true
+end
+_G.AceStopAntiBypassAimbot = function()
+    BatBypassV2.Stop()
+    _G.AceAntiBypassAimbotOn = false
+end
+_G.AceAntiBypassAimbotOn = _G.AceAntiBypassAimbotOn or false
 
 
 function startSpectrumBypassAimbot()
@@ -6893,8 +7018,9 @@ function setupMovementAndIndicators(char)
         local hrp = char2:FindFirstChild("HumanoidRootPart")
         if not hum or not hrp then return end
 
+        local bbOn = (BatBypassV2 and BatBypassV2.Enabled) == true
         if not autoBatEnabled and not autoLeftEnabled and not autoRightEnabled
-           and not autoBatV2Enabled and not batDesyncTpEnabled then
+           and not autoBatV2Enabled and not batDesyncTpEnabled and not bbOn then
             if _isRagdollState(hum) then
                 lastMoveDir = _V3zero
             else
